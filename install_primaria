@@ -1,0 +1,108 @@
+#!/bin/bash
+# WhatsApp Group Sender SaaS - Instalação Primária
+# Uso: sudo ./install_primaria
+
+set -e
+tput init
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  PROJECT_ROOT="$( cd -P "$( dirname "$SOURCE" )" 2>/dev/null && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$PROJECT_ROOT/$SOURCE"
+done
+PROJECT_ROOT="$( cd -P "$( dirname "$SOURCE" )" 2>/dev/null && pwd )"
+
+# Corrige line endings Windows (CRLF) -> Unix (LF)
+for f in "${PROJECT_ROOT}"/*.sh "${PROJECT_ROOT}"/variables/*.sh "${PROJECT_ROOT}"/lib/*.sh "${PROJECT_ROOT}"/utils/*.sh "${PROJECT_ROOT}"/scripts/*.sh "${PROJECT_ROOT}"/install_primaria "${PROJECT_ROOT}"/install_instancia; do
+  [ -f "$f" ] && sed -i 's/\r$//' "$f" 2>/dev/null || true
+done
+
+source "${PROJECT_ROOT}/variables/manifest.sh"
+source "${PROJECT_ROOT}/utils/manifest.sh"
+source "${PROJECT_ROOT}/lib/manifest.sh"
+source "${PROJECT_ROOT}/inquiry.sh"
+
+echo ""
+echo "=============================================="
+echo "  WhatsApp Group Sender SaaS - Instalação"
+echo "=============================================="
+echo ""
+
+inquiry_primaria
+source "${PROJECT_ROOT}/config"
+
+system_create_deploy_user "$DEPLOY_USER"
+
+sudo mkdir -p "$DEPLOY_DIR"
+sudo chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "$DEPLOY_DIR" 2>/dev/null || sudo chown "${DEPLOY_USER}:${DEPLOY_USER}" "$DEPLOY_DIR"
+
+system_update
+system_node_install
+system_postgres_install
+system_pm2_install
+system_nginx_install
+system_certbot_install
+system_redis_install
+system_go_install
+
+system_git_clone "$INST_DIR" "$REPO_URL" "$REPO_BRANCH" "$DEPLOY_USER"
+
+# Copia config para a instância (permite atualizar.sh encontrar mesmo rodando de outro diretório)
+if [[ -f "${PROJECT_ROOT}/config" ]] && [[ -d "$INST_DIR" ]]; then
+  mkdir -p "${INST_DIR}/installer"
+  cp "${PROJECT_ROOT}/config" "${INST_DIR}/installer/config"
+  chmod 600 "${INST_DIR}/installer/config"
+  chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "${INST_DIR}/installer"
+fi
+
+if [[ "$DB_USER" == "postgres" ]]; then
+  (cd /tmp && sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" -t -A 2>/dev/null) | grep -q 1 || \
+  (cd /tmp && sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER postgres;")
+else
+  backend_db_create "$DB_USER" "$DB_PASS" "$DB_NAME"
+fi
+
+backend_set_env "$INST_DIR"
+sudo chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "$INST_DIR"
+backend_node_dependencies "$INST_DIR"
+backend_node_build "$INST_DIR"
+backend_db_migrate "$INST_DIR"
+backend_db_seed "$INST_DIR"
+backend_start_pm2 "$INST_DIR" "$INSTANCE_NAME"
+
+wa_service_set_env "$INST_DIR"
+wa_service_build "$INST_DIR"
+wa_service_start_pm2 "$INST_DIR" "$INSTANCE_NAME"
+
+frontend_set_env "$INST_DIR"
+frontend_node_dependencies "$INST_DIR"
+frontend_node_build "$INST_DIR"
+
+if [[ -n "$SUBDOMAIN_BACKEND" ]]; then
+  backend_nginx_setup "$INSTANCE_NAME" "$SUBDOMAIN_BACKEND" "$PORT_BACKEND"
+fi
+if [[ -n "$SUBDOMAIN_FRONTEND" ]]; then
+  frontend_nginx_setup "$INST_DIR" "$INSTANCE_NAME" "$SUBDOMAIN_FRONTEND" "$PORT_BACKEND" "${PORT_WA_SERVICE:-4251}"
+else
+  frontend_start_pm2 "$INST_DIR" "$INSTANCE_NAME"
+fi
+
+[[ -n "$SUBDOMAIN_BACKEND" || -n "$SUBDOMAIN_FRONTEND" ]] && system_nginx_restart
+
+if [[ -n "$SUBDOMAIN_BACKEND" || -n "$SUBDOMAIN_FRONTEND" ]]; then
+  system_certbot_setup "$INSTANCE_NAME" "$SUBDOMAIN_BACKEND" "$SUBDOMAIN_FRONTEND"
+fi
+
+system_pm2_startup "$DEPLOY_USER"
+
+echo ""
+echo "Instalação concluída!"
+echo "  Deploy:   ${INST_DIR}"
+echo "  Backend:  ${BACKEND_URL}"
+echo "  Frontend: ${FRONTEND_URL}"
+echo "  Admin:    ${ADMIN_EMAIL}"
+echo ""
+echo "  PM2: processos rodando como usuário ${DEPLOY_USER}"
+echo "  Se o PM2 não iniciar no boot, execute: sudo -u ${DEPLOY_USER} pm2 startup"
+echo ""

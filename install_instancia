@@ -1,0 +1,125 @@
+#!/bin/bash
+# WhatsApp Group Sender SaaS - Nova Instância (segunda ou mais instalações)
+# Uso: cd instalador && sudo ./install_instancia
+
+set -e
+tput init
+
+# Resolve diretório do script
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  PROJECT_ROOT="$( cd -P "$( dirname "$SOURCE" )" 2>/dev/null && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$PROJECT_ROOT/$SOURCE"
+done
+PROJECT_ROOT="$( cd -P "$( dirname "$SOURCE" )" 2>/dev/null && pwd )"
+
+source "${PROJECT_ROOT}/variables/manifest.sh"
+source "${PROJECT_ROOT}/utils/manifest.sh"
+source "${PROJECT_ROOT}/lib/manifest.sh"
+source "${PROJECT_ROOT}/inquiry.sh"
+
+# Carrega config existente ou pede novo
+if [[ -f "${PROJECT_ROOT}/config" ]]; then
+  source "${PROJECT_ROOT}/config"
+  log_info "Config anterior encontrado. Deseja usar para nova instância ou configurar do zero?"
+  resp=$(prompt_yesno "Usar mesma config como base?" "n")
+  if [[ "$resp" != "s" ]]; then
+    inquiry_primaria
+    source "${PROJECT_ROOT}/config"
+  else
+    # Pede apenas nome da nova instância e ajusta
+    prompt_text NEW_INSTANCE "Nome da NOVA instância" ""
+    [[ -z "$NEW_INSTANCE" ]] && { log_err "Nome obrigatório"; exit 1; }
+    NEW_INSTANCE=$(echo "$NEW_INSTANCE" | tr -cd 'a-zA-Z0-9_-' | head -c 30)
+    INSTANCE_NAME="$NEW_INSTANCE"
+    DB_NAME="$NEW_INSTANCE"
+    INST_DIR="${DEPLOY_DIR}/${INSTANCE_NAME}"
+    # Atualiza config
+    sed -i "s/^INSTANCE_NAME=.*/INSTANCE_NAME=$INSTANCE_NAME/" "${PROJECT_ROOT}/config"
+    sed -i "s|^INST_DIR=.*|INST_DIR=$INST_DIR|" "${PROJECT_ROOT}/config"
+    sed -i "s/^DB_NAME=.*/DB_NAME=$DB_NAME/" "${PROJECT_ROOT}/config"
+    # Pede senha do banco para esta instância
+    prompt_text DB_PASS "Senha do banco para $INSTANCE_NAME" "" 1
+    [[ -z "$DB_PASS" ]] && { log_err "Senha obrigatória"; exit 1; }
+    sed -i "s|^DB_PASS=.*|DB_PASS=$DB_PASS|" "${PROJECT_ROOT}/config"
+    # Portas diferentes para cada instância (faixas: backend 4000-4999, frontend 3000-3999)
+    echo ""
+    echo "  Faixas: Backend 4000-4999 | Frontend 3000-3999 | WhatsApp Service 4251+"
+    prompt_text PORT_BACKEND "Porta do backend" "$((PORT_BACKEND + 1))"
+    prompt_text PORT_FRONTEND "Porta do frontend" "$((PORT_FRONTEND + 1))"
+    prompt_text PORT_WA_SERVICE "Porta do WhatsApp Service (Go)" "$((PORT_WA_SERVICE + 1))"
+    prompt_text SUBDOMAIN_BACKEND "Subdomínio backend (ex: api2.seudominio.com)" "$SUBDOMAIN_BACKEND"
+    prompt_text SUBDOMAIN_FRONTEND "Subdomínio frontend (ex: app2.seudominio.com)" "$SUBDOMAIN_FRONTEND"
+    sed -i "s/^PORT_BACKEND=.*/PORT_BACKEND=$PORT_BACKEND/" "${PROJECT_ROOT}/config"
+    sed -i "s/^PORT_FRONTEND=.*/PORT_FRONTEND=$PORT_FRONTEND/" "${PROJECT_ROOT}/config"
+    sed -i "s/^PORT_WA_SERVICE=.*/PORT_WA_SERVICE=${PORT_WA_SERVICE:-4252}/" "${PROJECT_ROOT}/config"
+    [[ -n "$SUBDOMAIN_BACKEND" ]] && BACKEND_URL="https://${SUBDOMAIN_BACKEND}" || BACKEND_URL="http://localhost:${PORT_BACKEND}"
+    [[ -n "$SUBDOMAIN_FRONTEND" ]] && FRONTEND_URL="https://${SUBDOMAIN_FRONTEND}" || FRONTEND_URL="http://localhost:${PORT_FRONTEND}"
+    FRONTEND_API_URL="$BACKEND_URL"
+  fi
+else
+  log_warn "Execute primeiro: ./install_primaria"
+  exit 1
+fi
+
+echo ""
+echo "=============================================="
+echo "  Nova instância: $INSTANCE_NAME"
+echo "=============================================="
+echo ""
+
+# Redis e Go (já instalados na primária; garantir em servidor só com nova instância)
+system_redis_install 2>/dev/null || true
+system_go_install 2>/dev/null || true
+
+# Criar banco (cd /tmp evita "Permission denied" para postgres em /root)
+if [[ "$DB_USER" == "postgres" ]]; then
+  (cd /tmp && sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" -t -A 2>/dev/null) | grep -q 1 || \
+  (cd /tmp && sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER postgres;")
+else
+  backend_db_create "$DB_USER" "$DB_PASS" "$DB_NAME"
+fi
+
+# Clonar
+system_git_clone "$INST_DIR" "$REPO_URL" "$REPO_BRANCH" "${DEPLOY_USER:-deploy}"
+
+# Backend
+backend_set_env "$INST_DIR"
+sudo chown -R "${DEPLOY_USER:-deploy}:${DEPLOY_USER:-deploy}" "$INST_DIR"
+backend_node_dependencies "$INST_DIR"
+backend_node_build "$INST_DIR"
+backend_db_migrate "$INST_DIR"
+backend_db_seed "$INST_DIR"
+backend_start_pm2 "$INST_DIR" "$INSTANCE_NAME"
+
+wa_service_set_env "$INST_DIR"
+wa_service_build "$INST_DIR"
+wa_service_start_pm2 "$INST_DIR" "$INSTANCE_NAME"
+
+# Frontend
+frontend_set_env "$INST_DIR"
+frontend_node_dependencies "$INST_DIR"
+frontend_node_build "$INST_DIR"
+
+# Nginx
+if [[ -n "$SUBDOMAIN_BACKEND" ]]; then
+  backend_nginx_setup "$INSTANCE_NAME" "$SUBDOMAIN_BACKEND" "$PORT_BACKEND"
+fi
+if [[ -n "$SUBDOMAIN_FRONTEND" ]]; then
+  frontend_nginx_setup "$INST_DIR" "$INSTANCE_NAME" "$SUBDOMAIN_FRONTEND" "$PORT_BACKEND" "${PORT_WA_SERVICE:-4251}"
+else
+  frontend_start_pm2 "$INST_DIR" "$INSTANCE_NAME"
+fi
+
+[[ -n "$SUBDOMAIN_BACKEND" || -n "$SUBDOMAIN_FRONTEND" ]] && system_nginx_restart
+
+if [[ -n "$SUBDOMAIN_BACKEND" && -n "$SUBDOMAIN_FRONTEND" ]]; then
+  system_certbot_setup "$INSTANCE_NAME" "$SUBDOMAIN_BACKEND" "$SUBDOMAIN_FRONTEND"
+fi
+
+echo ""
+log_ok "Instância $INSTANCE_NAME instalada!"
+echo "  Backend:  ${BACKEND_URL}"
+echo "  Frontend: ${FRONTEND_URL}"
+echo ""

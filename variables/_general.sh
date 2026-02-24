@@ -1,0 +1,24 @@
+#!/bin/bash
+# Valores padrão - sobrescritos pelo config após install_primaria
+
+INSTANCE_NAME=""
+DB_HOST="${DB_HOST:-localhost}"
+DB_PORT="${DB_PORT:-5432}"
+DB_USER="${DB_USER:-postgres}"
+DB_PASS=""
+DB_NAME=""
+
+PORT_BACKEND="${PORT_BACKEND:-4250}"
+PORT_FRONTEND="${PORT_FRONTEND:-3000}"
+PORT_WA_SERVICE="${PORT_WA_SERVICE:-4251}"
+REDIS_URI="${REDIS_URI:-}"
+
+SUBDOMAIN_FRONTEND=""
+SUBDOMAIN_BACKEND=""
+
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@admin.com}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+ADMIN_NAME="${ADMIN_NAME:-Administrador}"
+
+DEPLOY_USER="${DEPLOY_USER:-$USER}"
+DEPLOY_DIR="${DEPLOY_DIR:-/home/deploy}"
